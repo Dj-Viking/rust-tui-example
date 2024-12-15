@@ -25,14 +25,14 @@ fn handle_keypress_interactive(engine: &ConsoleEngine, adjust_in: i32) -> i32 {
     0
 }
 
-
+// chance to overflow with multiply :( maybe have to use 64 
 fn spiral_pattern(coord: (i32, i32), delta: i32, adjust_in: i32) -> Color {
     let mut ret = Color::Black;
 
     // THIS IS THE SPIRAL PATTERN! add delta to animate overtime!
-    let blue: u8 = (coord.1 * (delta - adjust_in) * coord.0 * (adjust_in * 2) ) as u8;
-    let red: u8 = (coord.1 * (delta - adjust_in) * coord.0 * (adjust_in * 2) + delta) as u8;
-    let green: u8 = 10;
+    let blue: u8 = (coord.1 * (delta * adjust_in) * coord.0 * (adjust_in * 2)) as u8;
+    let red: u8 = (20) as u8;
+    let green: u8 = (10) as u8;
 
     let rgb_vals = (red,green,blue);
     let rgb = Color::from(rgb_vals);
