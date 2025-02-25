@@ -3,15 +3,19 @@
 use portmidi::PortMidi;
 use nannou::prelude::*;
 
-use spectrum_analyzer::windows::hann_window;
-use spectrum_analyzer::{samples_fft_to_spectrum, FrequencyLimit};
-use spectrum_analyzer::{FrequencySpectrum};
-use spectrum_analyzer::scaling::divide_by_N_sqrt;
+use spectrum_analyzer::{
+	FrequencySpectrum, 
+	samples_fft_to_spectrum, 
+	FrequencyLimit,
+	windows::hann_window,
+	scaling::divide_by_N_sqrt
+};
 
 use std::sync::{Arc, Mutex};
 
 mod audio;
 mod midi;
+mod funcs;
 
 #[derive(Debug, Clone, PartialEq, Copy, Default)]
 #[repr(u8)]
@@ -26,7 +30,7 @@ enum ActiveFunc {
 
 struct State {
 	#[allow(clippy::type_complexity)]
-	funcs:       &'static [fn(f32, f32, f32, &FrequencySpectrum, f32) -> f32],
+	funcs:       &'static [funcs::VisualFunc],
 	ms:          Arc<Mutex<MutState>>,
 	sample_rate: u32,
 }
@@ -128,35 +132,15 @@ fn main() {
 			.key_released(key_released)
 			.build().unwrap(); 
 
+
 		State {
 			ms, sample_rate,
 			funcs: &[
-				|y, x, t, _, _| y * x * t, // spiralfunc
-				|y, x, t, _, _| 32.0 / (t / x) + y / (x / y - 1.0 / t) + t * (y * 0.05), // v2func
-				|y, x, t, _, _| x / y * t, // wavesfunc
-				|y, x, t, _, _| (x % 2.0 + 1000.0) / (y % 2.0 + 1000.0) * (t), // solidfunc
-				|y, x, t, fft_data, _| { // audiofunc
-
-					// magnitudes are huge coming from fft_data
-					// lets make it a usable number for our situation
-					// can noise clamp be controllable?
-					const NOISE_CLAMP: f32 = 10.0;
-					const FREQ_AVERAGE: f32 = 500.0;
-					const MAG_DIVISOR: f32 = 1000000.0;
-
-					let mut magthing = fft_data.data().iter()
-						.map(|&(f, m)| (f.val(), m.val() / MAG_DIVISOR))
-						.find(|&(f, _)| f >= FREQ_AVERAGE)
-						.and_then(|(_, m)| (m > NOISE_CLAMP).then_some(m))
-						.unwrap_or(0.0);
-
-					// can't get around the noise - not sure what to do with this yet
-					if magthing < 101.0 { magthing = 0.0 }
-					println!("what is this thing {}", magthing);
-					//println!("");
-					//println!("what is this {}", t / 100.0);
-					(y - magthing) * (x + magthing) * t / 100.0
-				}
+				funcs::SPIRAL_FUNC,
+				funcs::V2_FUNC,
+				funcs::WAVES_FUNC,
+				funcs::SOLID_FUNC,
+				funcs::AUDIO_FUNC
 			],
 		}
 	};
