@@ -91,6 +91,9 @@ impl Audio {
 	}
 
 	pub fn read_stream(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+		// note: make sure pavucontrol is running to ensure that
+		// pulseaudio is going to play nice and not have really bad
+		// latency (around 2 seconds between reads if pavucontrol is off)
 		self.sock.read_exact(&mut self.buf)?;
 
 		let mut cursor = Cursor::new(self.buf.as_slice());

@@ -1,18 +1,21 @@
+#![allow(static_mut_refs)]
+
 use portmidi::PortMidi;
 use nannou::prelude::*;
 
-use spectrum_analyzer::windows::hann_window;
 use spectrum_analyzer::{
 	FrequencySpectrum, 
 	samples_fft_to_spectrum, 
-	FrequencyLimit
+	FrequencyLimit,
+	windows::hann_window,
+	scaling::divide_by_N_sqrt
 };
-use spectrum_analyzer::scaling::divide_by_N_sqrt;
 
 use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
 
 mod audio;
+mod midi;
+mod funcs;
 
 #[derive(Debug, Clone, PartialEq, Copy, Default)]
 #[repr(u8)]
@@ -26,7 +29,8 @@ enum ActiveFunc {
 }
 
 struct State {
-	funcs:       &'static [fn(f32, f32, f32, &FrequencySpectrum, f32) -> f32],
+	#[allow(clippy::type_complexity)]
+	funcs:       &'static [funcs::VisualFunc],
 	ms:          Arc<Mutex<MutState>>,
 	sample_rate: u32,
 }
@@ -59,6 +63,7 @@ const CONF_FILE: &str = "config.toml";
 
 fn main() {
 	
+	// list midi devices in terminal
 	if std::env::args().skip(1).any(|a| a == "list") {
 		let pm_ctx = PortMidi::new().unwrap();
 		let devices = pm_ctx.devices().unwrap();
@@ -66,18 +71,21 @@ fn main() {
 		std::process::exit(0);
 	}
 
+	// init as hot reloadable??
 	let init = |a: &App| { 
-		//unsafe { AUDIO_STATE = vec![0.0; 256]; }
 
 		let ms = Arc::new(Mutex::new(MutState::default()));
 		let ms_ = ms.clone();
 
+			
 		let pm_ctx = PortMidi::new().unwrap();
-		let devices = pm_ctx.devices().unwrap();
+		let midi = midi::Midi::new(&pm_ctx).unwrap();
+
 
 		let mut audio = audio::Audio::init().unwrap();
 		let sample_rate = audio.sample_rate();
 
+		// audio stream thread
 		std::thread::spawn(move || {
 			loop {
 				std::thread::sleep(std::time::Duration::from_millis(1));
@@ -87,24 +95,9 @@ fn main() {
 
 		if !std::env::args().skip(1).any(|a| a == "keys") {
 
-			let (cfg, dev) = {
-				let mut config: HashMap<String, DConfig> = 
-					toml::from_str(&std::fs::read_to_string(CONF_FILE).unwrap()).unwrap_or_else(|e| {
-						eprintln!("Error reading config file: {e}");
-						std::process::exit(1);
-					});
-
-				let dev = devices.into_iter()
-					.find(|d| d.direction() == portmidi::Direction::Input && config.keys().any(|n| n == d.name()))
-					.unwrap_or_else(|| {
-						eprintln!("No device defined in config found");
-						std::process::exit(1);
-					});
-
-				(unsafe { config.remove(dev.name()).unwrap_unchecked() }, dev)
-			};
 			std::thread::spawn(move || {
-				let mut in_port = pm_ctx.input_port(dev, 256).unwrap();
+
+				let mut in_port = pm_ctx.input_port(midi.dev.clone(), 256).unwrap();
 
 				loop {
 					static mut BACKOFF: u8 = 0;
@@ -124,37 +117,9 @@ fn main() {
 						continue;
 					};
 
-					let channel   = m.message.data1;
-					let intensity = m.message.data2;
-
-					#[cfg(debug_assertions)]
-					println!("chan {} - intensity {}", channel, intensity);
-
 					let mut ms = ms_.lock().unwrap();
 
-					let max_intensity_range = match ms.func {
-						ActiveFunc::Solid | ActiveFunc::Waves => 100.0,
-						_ => 0.01,
-					};
-
-					match channel {
-						c if c == cfg.backwards => ms.is_backwards = !ms.is_backwards,
-
-						c if c == cfg.intensity      => ms.current_intensity = lerp_float(intensity, 0.0, max_intensity_range, 0, 127),
-						c if c == cfg.decay_factor   => ms.decay_factor = lerp_float(intensity, 0.0, 1.0, 0, 127),
-						c if c == cfg.time_dialation => ms.time_dialation = lerp_float(intensity, 0.0, 100.0, 0, 127),
-						_ if intensity == 0          => (),
-
-						c if c == cfg.spiral    => ms.func = ActiveFunc::Spiral,
-						c if c == cfg.v2        => ms.func = ActiveFunc::V2,
-						c if c == cfg.waves     => ms.func = ActiveFunc::Waves,
-						c if c == cfg.solid     => ms.func = ActiveFunc::Solid,
-						c if c == cfg.audio     => ms.func = ActiveFunc::Audio,
-
-						_ => (),
-					}
-
-					ms.is_reset = channel == cfg.reset && intensity > 0;
+					midi.handle_msg(m, &mut ms);
 
 					unsafe { BACKOFF = 0; }
 				}
@@ -167,35 +132,15 @@ fn main() {
 			.key_released(key_released)
 			.build().unwrap(); 
 
+
 		State {
 			ms, sample_rate,
 			funcs: &[
-				|y, x, t, _, _| y * x * t, // spiralfunc
-				|y, x, t, _, _| 32.0 / (t / x) + y / (x / y - 1.0 / t) + t * (y * 0.05), // v2func
-				|y, x, t, _, _| x / y * t, // wavesfunc
-				|y, x, t, _, _| (x % 2.0 + 1000.0) / (y % 2.0 + 1000.0) * (t), // solidfunc
-				|y, x, t, fft_data, time_divisor| { // audiofunc
-
-					// magnitudes are huge coming from fft_data
-					// lets make it a usable number for our situation
-					// can noise clamp be controllable?
-					const NOISE_CLAMP: f32 = 10.0;
-					const FREQ_AVERAGE: f32 = 500.0;
-					const MAG_DIVISOR: f32 = 1000000.0;
-
-					let mut magthing = fft_data.data().iter()
-						.map(|&(f, m)| (f.val(), m.val() / MAG_DIVISOR))
-						.find(|&(f, m)| f >= FREQ_AVERAGE)
-						.and_then(|(_, m)| (m > NOISE_CLAMP).then(|| m))
-						.unwrap_or(0.0);
-
-					// can't get around the noise - not sure what to do with this yet
-					if magthing < 101.0 { magthing = 0.0 }
-					println!("what is this thing {}", magthing);
-					//println!("");
-					//println!("what is this {}", t / 100.0);
-					(y - magthing) * (x + magthing) * t / 100.0
-				}
+				funcs::SPIRAL_FUNC,
+				funcs::V2_FUNC,
+				funcs::WAVES_FUNC,
+				funcs::SOLID_FUNC,
+				funcs::AUDIO_FUNC
 			],
 		}
 	};
@@ -289,8 +234,8 @@ fn view(app: &App, s: &State, frame: Frame) {
 		if ms.is_reset { unsafe { TIME = 0.0; } }
 		
 		let t = unsafe { TIME } /
-			(time_divisor + 100000.0 * (ms.time_dialation as f32 / 10.0))
-			+ ms.current_intensity as f32 / 100.0;
+			(time_divisor + 100000.0 * (ms.time_dialation / 10.0))
+			+ ms.current_intensity / 100.0;
 
 		let val = s.funcs[ms.func as u8 as usize](r.y(), r.x(), t, &fft, time_divisor);
 
@@ -301,46 +246,13 @@ fn view(app: &App, s: &State, frame: Frame) {
 	draw.to_frame(app, &frame).unwrap();
 }
 
-fn exponential_moving_average(data: &[(f32, f32)], alpha: f32) -> Vec<(f32, f32)> {
-    let mut smoothed = Vec::with_capacity(data.len());
-    let mut prev = data[0];
-    for &(fr, val) in data {
-        let smoothed_val = alpha * val + (1.0 - alpha) * prev.1;
-        smoothed.push((fr, smoothed_val));
-        prev = (fr, smoothed_val);
-    }
-    smoothed
-}
-
-// output a number within a specific range from an entirely different range
-/*
- * @param input          - input value to determine what position in the range the number sits
- * @param min_output     - minimum percentage value
- * @param max_output     - maximum percentage value
- * @param min_input      - minimum input value the range can be
- * @param max_input      - maximum input value the range can be
- */
-fn lerp_float(
-    input:      u8,
-    min_output: f32,
-    max_output: f32,
-    min_input:  u8,
-    max_input:  u8,
-) -> f32 {
-
-	let val = (max_output - min_output) * ((input - min_input) as f32)
-	   / ((max_input - min_input) as f32) + min_output;
-	println!("lerp float {}", val);
-	val
-}
-
-// fn lerp_unsigned(
-//     input:      u8,
-//     min_output: u8,
-//     max_output: u8,
-//     min_input:  u8,
-//     max_input:  u8,
-// ) -> u8 {
-// 	Math.floor(((max_output - min_output) * (input - min_input)) 
-// 		/ (max_input - min_input) + min_output)
+// fn exponential_moving_average(data: &[(f32, f32)], alpha: f32) -> Vec<(f32, f32)> {
+//     let mut smoothed = Vec::with_capacity(data.len());
+//     let mut prev = data[0];
+//     for &(fr, val) in data {
+//         let smoothed_val = alpha * val + (1.0 - alpha) * prev.1;
+//         smoothed.push((fr, smoothed_val));
+//         prev = (fr, smoothed_val);
+//     }
+//     smoothed
 // }
